@@ -1,11 +1,11 @@
 import AppKit
 
-nonisolated fileprivate struct MosaicCell: Hashable {
+fileprivate struct MosaicCell: Hashable {
     let column: Int
     let row: Int
 }
 
-nonisolated fileprivate final class MosaicCellStorage {
+fileprivate final class MosaicCellStorage {
     var cells: Set<MosaicCell>
 
     init(cells: Set<MosaicCell> = []) {

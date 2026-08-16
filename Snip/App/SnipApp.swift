@@ -2,6 +2,7 @@
 import Darwin
 
 @available(macOS 13.0, *)
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // 管理器
     private var captureManager: CaptureManager?

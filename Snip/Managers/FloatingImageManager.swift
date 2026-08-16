@@ -2,6 +2,7 @@ import AppKit
 import ImageIO
 import UniformTypeIdentifiers
 
+@MainActor
 class FloatingImageManager {
     static let shared = FloatingImageManager()
     private let reuseFloatingWindows = true
