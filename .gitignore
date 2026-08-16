@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Local agent and editor state
+.claude/
+.pi-subagents/
+
+# Xcode - User specific files
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad
+*.xcbkptlist
+
+# Xcode - Build products
+build/
+DerivedData/
+
+# Swift Package Manager
+.swiftpm/
+.build/
+
+# CocoaPods
+Pods/
+
+# Carthage
+Carthage/Build/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
