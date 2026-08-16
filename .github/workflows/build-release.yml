@@ -1,0 +1,93 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-dmg:
+    name: Build universal macOS DMG
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build universal Release app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Snip.xcodeproj \
+            -scheme Snip \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/SnipDerivedData" \
+            -destination "generic/platform=macOS" \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            MACOSX_DEPLOYMENT_TARGET=14.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            build | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Verify application architectures
+        run: |
+          APP_PATH="$RUNNER_TEMP/SnipDerivedData/Build/Products/Release/Snip.app"
+          test -d "$APP_PATH"
+          lipo "$APP_PATH/Contents/MacOS/Snip" -archs | tee "$RUNNER_TEMP/architectures.txt"
+          grep -q "arm64" "$RUNNER_TEMP/architectures.txt"
+          grep -q "x86_64" "$RUNNER_TEMP/architectures.txt"
+          plutil -p "$APP_PATH/Contents/Info.plist"
+
+      - name: Create DMG
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$RUNNER_TEMP/SnipDerivedData/Build/Products/Release/Snip.app"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
+          DMG_NAME="Snip-${VERSION}.dmg"
+          STAGING_DIR="$RUNNER_TEMP/SnipDMG"
+
+          rm -rf "$STAGING_DIR" dist
+          mkdir -p "$STAGING_DIR" dist
+          cp -R "$APP_PATH" "$STAGING_DIR/Snip.app"
+          ln -s /Applications "$STAGING_DIR/Applications"
+
+          hdiutil create \
+            -volname "Snip" \
+            -srcfolder "$STAGING_DIR" \
+            -ov \
+            -format UDZO \
+            -imagekey zlib-level=9 \
+            "dist/$DMG_NAME"
+
+          hdiutil verify "dist/$DMG_NAME"
+          (cd dist && shasum -a 256 "$DMG_NAME" > "$DMG_NAME.sha256")
+          (cd dist && shasum -a 256 -c "$DMG_NAME.sha256")
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Snip-macOS-DMG
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.dmg
+            dist/*.sha256
