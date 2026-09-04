@@ -1370,7 +1370,7 @@ class CaptureView: NSView {
                 Logger.log("📸 开始捕获最后一张图片...")
                 if let lastImage = await captureView.captureCurrentSelection() {
                     Logger.log("✅ 成功捕获最后一张，大小: \(lastImage.logicalSize)")
-                    ScrollCaptureManager.shared.addFinalImage(lastImage)
+                    await ScrollCaptureManager.shared.addFinalImage(lastImage)
                     Logger.log("📸 添加后总数: \(ScrollCaptureManager.shared.captureCount) 张")
                 } else {
                     Logger.log("❌ 捕获最后一张失败！")
@@ -1922,7 +1922,10 @@ class CaptureView: NSView {
             callback: { _, type, event, userInfo in
                 guard type == .scrollWheel, let userInfo else { return Unmanaged.passUnretained(event) }
                 let captureView = Unmanaged<CaptureView>.fromOpaque(userInfo).takeUnretainedValue()
-                captureView.handleObservedScrollForInteraction(at: NSEvent.mouseLocation)
+                let screenPoint = NSEvent.mouseLocation
+                DispatchQueue.main.async {
+                    captureView.handleObservedScrollForInteraction(at: screenPoint)
+                }
                 return Unmanaged.passUnretained(event)
             },
             userInfo: userInfo

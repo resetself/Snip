@@ -19,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSHumanReadableCopyright</key>
@@ -30,7 +30,5 @@
 	<string>Snip 需要此权限来执行截图操作。</string>
 	<key>NSScreenCaptureDescription</key>
 	<string>Snip 需要屏幕录制权限来捕获屏幕内容进行截图。</string>
-	<key>NSAccessibilityUsageDescription</key>
-	<string>Snip 需要辅助功能权限来监听全局快捷键和实现长截图滚动功能。</string>
 </dict>
 </plist>
