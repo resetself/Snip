@@ -73,6 +73,32 @@ final class ManagedRasterImage {
         return image
     }
 
+    func pngData() -> Data? {
+        autoreleasepool {
+            guard let mutableData = CFDataCreateMutable(nil, 0),
+                  let destination = CGImageDestinationCreateWithData(
+                      mutableData,
+                      UTType.png.identifier as CFString,
+                      1,
+                      nil
+                  ) else {
+                return nil
+            }
+
+            CGImageDestinationAddImage(destination, cgImage, nil)
+            guard CGImageDestinationFinalize(destination) else { return nil }
+            return mutableData as Data
+        }
+    }
+
+    func tiffData() -> Data? {
+        autoreleasepool {
+            let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
+            bitmapRep.size = logicalSize
+            return bitmapRep.tiffRepresentation
+        }
+    }
+
     func write(to url: URL) throws {
         let fileExtension = url.pathExtension.lowercased()
         let destinationType: UTType = (fileExtension == "jpg" || fileExtension == "jpeg") ? .jpeg : .png

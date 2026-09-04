@@ -1,17 +1,42 @@
 import AppKit
-import ImageIO
-import UniformTypeIdentifiers
+
+#if DEBUG
+private final class WeakImageReleaseProbe {
+    weak var managedImage: ManagedRasterImage?
+    weak var cgImage: CGImage?
+    let label: String
+
+    init(image: ManagedRasterImage, label: String) {
+        managedImage = image
+        cgImage = image.cgImage
+        self.label = label
+    }
+
+    var status: String {
+        "\(label): ManagedRasterImage=\(managedImage == nil ? "released" : "alive"), " +
+            "CGImage=\(cgImage == nil ? "released" : "alive")"
+    }
+}
+#endif
 
 @MainActor
 class FloatingImageManager {
     static let shared = FloatingImageManager()
-    private let reuseFloatingWindows = true
+    // Closing a pin should release its window immediately. Keeping even an empty shell
+    // complicates AppKit ownership and delays backing-store reclamation.
+    private let reuseFloatingWindows = false
     private let maxReusableWindowCount = 1
     private let reusePoolDrainDelay: TimeInterval = 8
+    private let maximumFloatingWindowLifetime: TimeInterval = 24 * 60 * 60
     private let floatingWindows = NSHashTable<FloatingImageWindow>.weakObjects()
     private var reusableWindows: [FloatingImageWindow] = []
     private var reusePoolDrainWorkItem: DispatchWorkItem?
     private var windowOffset: CGFloat = 0
+    var onActivityChanged: (() -> Void)?
+
+    var activeWindowCount: Int {
+        activeFloatingWindows(excluding: nil).count
+    }
 
     private init() {}
 
@@ -60,6 +85,8 @@ class FloatingImageManager {
                 displaySize: displaySize
             )
             floatingWindows.add(window)
+            window.scheduleAutomaticClose(after: maximumFloatingWindowLifetime)
+            onActivityChanged?()
 
             Logger.log("✅ 贴图窗口已配置，当前活动窗口数: \(activeFloatingWindows(excluding: nil).count)")
 
@@ -70,6 +97,8 @@ class FloatingImageManager {
                 let remainingWindows = self.activeFloatingWindows(excluding: closingWindow)
                 Logger.log("🗑️ 窗口进入关闭流程，剩余活动贴图窗口: \(remainingWindows.count)")
                 IdleMemoryReclaimer.shared.markUserActivity()
+
+                self.onActivityChanged?()
 
                 if remainingWindows.isEmpty {
                     Logger.log("🧹 所有贴图窗口已关闭")
@@ -98,6 +127,11 @@ class FloatingImageManager {
             window.orderFrontRegardless()
             Logger.log("✅ 窗口已显示")
         }
+    }
+
+    func closeAllWindows() {
+        let windows = activeFloatingWindows(excluding: nil)
+        windows.forEach { $0.closeAndRelease() }
     }
 
     func releaseHiddenWindows() {
@@ -163,6 +197,8 @@ class FloatingImageManager {
     private func activeFloatingWindows(excluding excludedWindow: FloatingImageWindow?) -> [FloatingImageWindow] {
         floatingWindows.allObjects.filter { floatingWindow in
             floatingWindow !== excludedWindow
+                && !floatingWindow.isStoredForReuse
+                && !floatingWindow.isClosing
         }
     }
 }
@@ -185,6 +221,7 @@ class FloatingImageWindow: NSWindow {
     private var displayImage: ManagedRasterImage?
     private var originalImage: ManagedRasterImage?
     private var displaySize: NSSize = NSSize(width: 1, height: 1)
+    private var automaticCloseWorkItem: DispatchWorkItem?
     private(set) var isStoredForReuse = false
     var debugIdentifier: String {
         String(describing: Unmanaged.passUnretained(self).toOpaque())
@@ -233,22 +270,42 @@ class FloatingImageWindow: NSWindow {
         orderOut(nil)
     }
 
+    func scheduleAutomaticClose(after interval: TimeInterval) {
+        automaticCloseWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.isClosing, !self.isStoredForReuse else { return }
+            Logger.log("⏳ 贴图已超过 \(Int(interval / 3600)) 小时，自动关闭: \(self.debugIdentifier)")
+            self.closeAndRelease()
+        }
+        automaticCloseWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: workItem)
+    }
+
+    private func cancelAutomaticClose() {
+        automaticCloseWorkItem?.cancel()
+        automaticCloseWorkItem = nil
+    }
+
     private func closeForUserInteraction() {
         guard !isClosing else { return }
-        isClosing = true
-        Logger.log("🗑️ 用户双击隐藏贴图: \(debugIdentifier)")
+        Logger.log("🗑️ 用户双击关闭贴图: \(debugIdentifier)")
 
-        // Keep user-initiated dismissal independent from image/resource teardown. AppKit
-        // finishes hiding the window without closing it or releasing its backing objects.
-        orderOut(nil)
-        isClosing = false
+        // orderOut(_:) only hides the window. NSApplication continues retaining the
+        // NSWindow, which in turn retains the full-resolution image and backing store.
+        // Use the normal teardown path so a dismissed pin actually releases its memory.
+        closeAndRelease()
     }
 
     func closeAndRelease() {
         guard !isClosing else { return }
         autoreleasepool {
             isClosing = true
+            cancelAutomaticClose()
             let windowID = debugIdentifier
+            #if DEBUG
+            let releaseProbes = makeImageReleaseProbes()
+            #endif
 
             Logger.logMemory("🗑️ 开始释放浮动窗口资源: \(windowID)")
             Logger.log("🪟 释放前状态: \(debugStateSummary)")
@@ -259,6 +316,9 @@ class FloatingImageWindow: NSWindow {
             orderOut(nil)
             currentScale = 1.0
             Logger.logMemory("🗑️ 图片对象引用已清理: \(windowID)")
+            #if DEBUG
+            scheduleImageReleaseProbe(releaseProbes, windowID: windowID)
+            #endif
 
             // 强制刷新 Core Animation 事务，立即释放 backing store
             CATransaction.flush()
@@ -298,6 +358,7 @@ class FloatingImageWindow: NSWindow {
             Logger.log("🪟 复用池释放前状态: \(debugStateSummary)")
 
             isClosing = true
+            cancelAutomaticClose()
             isStoredForReuse = false
             onClose = nil
             purgeImageView()
@@ -318,9 +379,7 @@ class FloatingImageWindow: NSWindow {
     override func mouseDown(with event: NSEvent) {
         IdleMemoryReclaimer.shared.markUserActivity()
         if event.clickCount == 2 {
-            // Finish AppKit's click dispatch before tearing down the window. User-initiated
-            // close intentionally bypasses the reuse/reclaim callback chain: closing one
-            // image must not affect the application's status-bar lifetime.
+            // Finish AppKit's click dispatch before tearing down the window.
             DispatchQueue.main.async { [weak self] in
                 self?.closeForUserInteraction()
             }
@@ -364,16 +423,18 @@ class FloatingImageWindow: NSWindow {
                 let pasteboard = NSPasteboard.general
                 pasteboard.clearContents()
 
-                // 创建 PNG 数据
-                if let pngData = createPNGData(from: imageForPasteboard.cgImage) {
+                // PNG 数据写入系统剪贴板后不再持有编码缓冲区。
+                if let pngData = imageForPasteboard.pngData() {
                     pasteboard.setData(pngData, forType: .png)
                     Logger.log("📋 已复制图片到剪贴板（PNG 格式）")
+                } else if let tiffData = imageForPasteboard.tiffData() {
+                    pasteboard.setData(tiffData, forType: .tiff)
+                    Logger.log("📋 已复制图片到剪贴板（TIFF 降级格式）")
                 } else {
-                    // 降级方案：使用 NSImage
-                    pasteboard.writeObjects([imageForPasteboard.makeNSImageForPasteboard()])
-                    Logger.log("📋 已复制图片到剪贴板（NSImage 格式）")
+                    Logger.log("❌ 图片编码失败，未写入剪贴板")
                 }
             }
+            malloc_zone_pressure_relief(nil, 0)
             return
         }
 
@@ -424,6 +485,46 @@ class FloatingImageWindow: NSWindow {
 
         Logger.log("🔍 缩放: \(String(format: "%.0f", currentScale * 100))%")
     }
+
+    #if DEBUG
+    private func makeImageReleaseProbes() -> [WeakImageReleaseProbe] {
+        var seenImages = Set<ObjectIdentifier>()
+        var probes: [WeakImageReleaseProbe] = []
+
+        func append(_ image: ManagedRasterImage?, label: String) {
+            guard let image else { return }
+            let identifier = ObjectIdentifier(image)
+            guard seenImages.insert(identifier).inserted else { return }
+            probes.append(WeakImageReleaseProbe(image: image, label: label))
+        }
+
+        append(displayImage, label: "display")
+        append(originalImage, label: "original")
+        return probes
+    }
+
+    private func scheduleImageReleaseProbe(
+        _ probes: [WeakImageReleaseProbe],
+        windowID: String
+    ) {
+        guard !probes.isEmpty else { return }
+
+        func logStatus(after description: String) {
+            let status = probes.map(\.status).joined(separator: "; ")
+            Logger.logMemory("🔬 图片释放检测 \(description): \(windowID) | \(status)")
+        }
+
+        DispatchQueue.main.async {
+            logStatus(after: "next-runloop")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            logStatus(after: "1s")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9) {
+            logStatus(after: "9s")
+        }
+    }
+    #endif
 
     private func purgeImageView() {
         imageView?.releaseResources()
@@ -497,6 +598,9 @@ class FloatingImageWindow: NSWindow {
         let wasRegisteredInApp = NSApp.windows.contains { $0 === self }
         Logger.log("🪟 销毁前窗口壳状态: \(debugStateSummary) appRegistered=\(wasRegisteredInApp)")
         orderOut(nil)
+        // ARC owns NSWindow lifetime. isReleasedWhenClosed must remain false; enabling
+        // AppKit's legacy release-on-close ownership can terminate or over-release an
+        // accessory app when its last floating window disappears.
         close()
     }
 
@@ -561,26 +665,8 @@ class FloatingImageWindow: NSWindow {
         )
     }
 
-    private func createPNGData(from cgImage: CGImage) -> Data? {
-        guard let mutableData = CFDataCreateMutable(nil, 0),
-              let destination = CGImageDestinationCreateWithData(
-                  mutableData,
-                  UTType.png.identifier as CFString,
-                  1,
-                  nil
-              ) else {
-            return nil
-        }
-
-        CGImageDestinationAddImage(destination, cgImage, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            return nil
-        }
-
-        return mutableData as Data
-    }
-
     deinit {
+        automaticCloseWorkItem?.cancel()
         Logger.log("🧹 FloatingImageWindow 已释放")
     }
 }

@@ -33,7 +33,9 @@ struct Logger {
     nonisolated static func log(_ message: String) {
         guard isEnabled else { return }
 
-        let line = "[Snip] \(message)"
+        let role = CommandLine.arguments.contains("--ui-helper") ? "helper" : "main"
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let line = "[Snip \(role):\(pid)] \(message)"
         NSLog("%@", line)
     }
 

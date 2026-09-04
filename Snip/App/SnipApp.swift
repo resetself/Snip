@@ -5,10 +5,9 @@ import Darwin
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // 管理器
-    private var captureManager: CaptureManager?
     private var statusBarManager: StatusBarManager?
     private var hotkeyManager: HotkeyManager?
-    private let idleMemoryReclaimer = IdleMemoryReclaimer.shared
+    private let helperController = CaptureHelperController()
 
     // 偏好设置窗口
     private var preferencesWindow: PreferencesWindow?
@@ -25,13 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 初始化管理器
         setupManagers()
-        idleMemoryReclaimer.start()
-        idleMemoryReclaimer.markUserActivity()
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        idleMemoryReclaimer.stop()
-    }
+    func applicationWillTerminate(_ notification: Notification) {}
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
@@ -47,9 +42,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 管理器设置
 
     private func setupManagers() {
-        // 截图管理器
-        captureManager = CaptureManager()
-
         // 状态栏管理器
         statusBarManager = StatusBarManager()
         statusBarManager?.setup()
@@ -80,68 +72,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 操作处理
 
     private func handleCapture() {
-        idleMemoryReclaimer.markUserActivity()
-        captureManager?.startCapture()
+        helperController.capture()
     }
 
     private func handlePaste() {
-        idleMemoryReclaimer.markUserActivity()
-
-        autoreleasepool {
-            let pasteboard = NSPasteboard.general
-
-            // 优先从 PNG/TIFF 数据创建，避免 NSImage 的内存开销
-            if let pngData = pasteboard.data(forType: .png),
-               let cgImage = createCGImage(from: pngData),
-               let rasterImage = createRasterImage(from: cgImage, label: "pasteboard-png") {
-                let mouseLocation = NSEvent.mouseLocation
-                FloatingImageManager.shared.createFloatingWindow(with: rasterImage, at: mouseLocation)
-                return
-            }
-
-            if let tiffData = pasteboard.data(forType: .tiff),
-               let cgImage = createCGImage(from: tiffData),
-               let rasterImage = createRasterImage(from: cgImage, label: "pasteboard-tiff") {
-                let mouseLocation = NSEvent.mouseLocation
-                FloatingImageManager.shared.createFloatingWindow(with: rasterImage, at: mouseLocation)
-                return
-            }
-
-            // 降级方案：使用 NSImage
-            if let image = NSImage(pasteboard: pasteboard),
-               let rasterImage = ManagedRasterImage(nsImage: image, label: "pasteboard") {
-                let mouseLocation = NSEvent.mouseLocation
-                FloatingImageManager.shared.createFloatingWindow(with: rasterImage, at: mouseLocation)
-                return
-            }
-
-            NSSound.beep()
-            Logger.log("⚠️ 贴图失败：剪贴板中没有图片")
-        }
-    }
-
-    private func createCGImage(from data: Data) -> CGImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            return nil
-        }
-        return cgImage
-    }
-
-    private func createRasterImage(from cgImage: CGImage, label: String) -> ManagedRasterImage? {
-        let width = CGFloat(cgImage.width)
-        let height = CGFloat(cgImage.height)
-        guard width > 0, height > 0 else { return nil }
-
-        // 假设是 2x Retina 图片，如果实际是 1x 会稍微模糊但不影响使用
-        let scale: CGFloat = 2.0
-        let logicalSize = NSSize(width: width / scale, height: height / scale)
-
-        return ManagedRasterImage(cgImage: cgImage, logicalSize: logicalSize, label: label)
+        helperController.paste()
     }
 
     private func handlePreferences() {
-        idleMemoryReclaimer.markUserActivity()
         if preferencesWindow == nil {
             preferencesWindow = PreferencesWindow()
 
@@ -158,8 +96,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleQuit() {
-        isExplicitQuitRequested = true
-        NSApplication.shared.terminate(nil)
+        helperController.shutdown { [weak self] in
+            self?.isExplicitQuitRequested = true
+            NSApplication.shared.terminate(nil)
+        }
     }
 
 }
@@ -350,7 +290,17 @@ final class IdleMemoryReclaimer {
     }
 
     private var hasVisibleWindows: Bool {
-        NSApp.windows.contains(where: isWindowActuallyVisible(_:))
+        // Only Snip's resource-owning windows should postpone strong reclamation.
+        // AppKit can keep auxiliary/system windows registered and report them visible
+        // even after all capture and pin windows have been destroyed.
+        NSApp.windows.contains { window in
+            guard window is CaptureWindow
+                    || window is FloatingImageWindow
+                    || window is ScrollCaptureToolbarWindow else {
+                return false
+            }
+            return isWindowActuallyVisible(window)
+        }
     }
 
     private var hasVisibleCaptureWindows: Bool {

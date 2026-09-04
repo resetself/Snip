@@ -11,10 +11,26 @@ enum WindowLevels {
 
 @available(macOS 13.0, *)
 class CaptureManager: NSObject {
-    private var captureWindows: [NSWindow] = []
-    private var isCapturing = false
+    private var captureWindows: [CaptureWindow] = []
+    private var isCapturing = false {
+        didSet {
+            guard oldValue != isCapturing else { return }
+            onActivityChanged?()
+        }
+    }
+    private var pendingFloatingWindowCreationCount = 0 {
+        didSet {
+            guard oldValue != pendingFloatingWindowCreationCount else { return }
+            onActivityChanged?()
+        }
+    }
     private var previousFrontmostApplication: NSRunningApplication?
     private var captureSessionID: UInt64 = 0
+    var onActivityChanged: (() -> Void)?
+
+    var hasActiveCaptureSession: Bool {
+        isCapturing || !captureWindows.isEmpty || pendingFloatingWindowCreationCount > 0
+    }
 
     deinit {
         closeAllWindows()
@@ -36,12 +52,13 @@ class CaptureManager: NSObject {
 
             // Capture before creating or activating Snip's overlay. Activating the
             // overlay dismisses system menus and changes the appearance of floating windows.
-            let initialImages = await self.captureInitialScreenImages()
+            let initialImages = self.captureInitialScreenImages()
             guard self.captureSessionID == sessionID, self.isCapturing else { return }
 
             self.previousFrontmostApplication = NSWorkspace.shared.frontmostApplication
             self.closeAllWindows()
             self.createCaptureWindows(initialImages: initialImages)
+            self.onActivityChanged?()
         }
     }
 
@@ -67,6 +84,7 @@ class CaptureManager: NSObject {
     private func closeAllWindows() {
         let windows = captureWindows
         captureWindows.removeAll()
+        onActivityChanged?()
         guard !windows.isEmpty else { return }
 
         Logger.logMemory("🧹 closeAllWindows 开始，待关闭截图窗口: \(windows.count)")
@@ -76,19 +94,16 @@ class CaptureManager: NSObject {
                 view.cleanup()
             }
 
-            // 收缩 backing store 以释放内存
-            let collapsedSize = NSSize(width: 1, height: 1)
+            window.orderOut(nil)
+
+            // Shrink the WindowServer backing surface before dropping the content view.
             window.setFrame(
-                NSRect(origin: window.frame.origin, size: collapsedSize),
+                NSRect(origin: window.frame.origin, size: NSSize(width: 1, height: 1)),
                 display: false,
                 animate: false
             )
-
             window.contentView = nil
-
-            // 强制刷新 Core Animation 事务
             CATransaction.flush()
-
             window.close()
         }
 
@@ -105,65 +120,134 @@ class CaptureManager: NSObject {
         }
     }
 
-    private func captureInitialScreenImages() async -> [CGDirectDisplayID: ManagedRasterImage] {
-        do {
-            let content = try await ScreenCaptureContentCache.shared.content(forceRefresh: true)
-            var images: [CGDirectDisplayID: ManagedRasterImage] = [:]
+    private func captureInitialScreenImages() -> [CGDirectDisplayID: ManagedRasterImage] {
+        // Permission has already been checked by startCapture(). Do not fetch
+        // SCShareableContent here merely to validate display IDs: that starts an XPC
+        // decode and retains ScreenCaptureKit metadata even though this path captures
+        // through CoreGraphics.
+        var images: [CGDirectDisplayID: ManagedRasterImage] = [:]
 
-            for screen in NSScreen.screens {
-                guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
-                      content.displays.contains(where: { $0.displayID == displayID }) else {
-                    Logger.log("⚠️ 未找到显示器截图源")
-                    continue
-                }
-
-                do {
-                    // CGWindowListCreateImage requests the WindowServer-composited
-                    // display image. Unlike ScreenCaptureKit content frames, it can
-                    // retain AppKit window framing and native shadows.
-                    let quartzBounds = CGDisplayBounds(displayID)
-                    guard let image = captureCompositedDisplayImage(quartzBounds) else {
-                        throw NSError(
-                            domain: "Snip.CaptureManager",
-                            code: 1,
-                            userInfo: [NSLocalizedDescriptionKey: "WindowServer returned no display image"]
-                        )
-                    }
-
-                    images[displayID] = ManagedRasterImage(
-                        cgImage: image,
-                        logicalSize: screen.frame.size,
-                        label: "initial-composited-screen-preview"
-                    )
-                } catch {
-                    // Keep successful displays; only the failed display uses the
-                    // existing post-overlay capture fallback.
-                    Logger.log("⚠️ 显示器预采集失败: \(error.localizedDescription)")
-                }
+        for screen in NSScreen.screens {
+            guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+                Logger.log("⚠️ 未找到显示器截图源")
+                continue
             }
 
-            return images
-        } catch {
-            Logger.log("⚠️ 截图预采集失败: \(error.localizedDescription)")
-            return [:]
+            autoreleasepool {
+                // CGWindowListCreateImage requests the WindowServer-composited display.
+                // Copy it immediately into an application-owned bitmap so the preview
+                // does not keep the WindowServer capture surface alive for the session.
+                guard let capturedImage = captureDisplayImage(displayID) else {
+                    Logger.log("⚠️ 显示器预采集失败: CoreGraphics returned no display image")
+                    return
+                }
+
+                let image = copyToMemoryBackedCGImage(capturedImage)
+                images[displayID] = ManagedRasterImage(
+                    cgImage: image,
+                    logicalSize: screen.frame.size,
+                    label: "initial-composited-screen-preview"
+                )
+            }
         }
+
+        return images
     }
 
-    private func captureCompositedDisplayImage(_ bounds: CGRect) -> CGImage? {
-        typealias CaptureFunction = @convention(c) (
-            CGRect,
-            CGWindowListOption,
-            CGWindowID,
-            CGWindowImageOption
-        ) -> CGImage?
-
-        guard let handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
-              let symbol = dlsym(handle, "CGWindowListCreateImage") else {
-            return nil
+    private func copyToMemoryBackedCGImage(_ image: CGImage) -> CGImage {
+        let width = image.width
+        let height = image.height
+        guard width > 0,
+              height > 0,
+              width <= Int.max / 4 else {
+            return image
         }
 
-        let capture = unsafeBitCast(symbol, to: CaptureFunction.self)
-        return capture(bounds, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution])
+        // Only rows need bitmap-friendly alignment. mmap already page-aligns the whole
+        // allocation; page-aligning every row wastes several MB on a Retina display.
+        let minimumBytesPerRow = width * 4
+        let rowAlignment = 64
+        guard minimumBytesPerRow <= Int.max - (rowAlignment - 1) else { return image }
+        let bytesPerRow = ((minimumBytesPerRow + rowAlignment - 1) / rowAlignment) * rowAlignment
+        guard height <= Int.max / bytesPerRow else { return image }
+        let byteCount = bytesPerRow * height
+
+        let mappedData = mmap(
+            nil,
+            byteCount,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANON,
+            -1,
+            0
+        )
+        guard mappedData != MAP_FAILED, let mappedData else { return image }
+
+        let colorSpace = image.colorSpace
+            ?? CGColorSpace(name: CGColorSpace.sRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue
+            | CGImageAlphaInfo.premultipliedLast.rawValue
+
+        guard let context = CGContext(
+            data: mappedData,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            munmap(mappedData, byteCount)
+            return image
+        }
+
+        context.interpolationQuality = .none
+        context.setShouldAntialias(false)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        guard let provider = CGDataProvider(
+            dataInfo: nil,
+            data: UnsafeRawPointer(mappedData),
+            size: byteCount,
+            releaseData: { _, data, size in
+                let result = munmap(UnsafeMutableRawPointer(mutating: data), size)
+                #if DEBUG
+                let sizeMB = Double(size) / 1024 / 1024
+                let formattedSize = String(format: "%.1f", sizeMB)
+                Logger.log("🧠 全屏预览像素映射已 munmap: \(formattedSize) MB result=\(result)")
+                #endif
+            }
+        ) else {
+            munmap(mappedData, byteCount)
+            return image
+        }
+
+        guard let copiedImage = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: bitmapInfo),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: image.renderingIntent
+        ) else {
+            // provider owns mappedData here and releases it when leaving scope.
+            return image
+        }
+
+        return copiedImage
+    }
+
+    private func captureDisplayImage(_ displayID: CGDirectDisplayID) -> CGImage? {
+        // Capture the display directly instead of CGWindowListCreateImage. The latter
+        // leaves a native-resolution WindowServer capture surface cached after each call
+        // on recent macOS releases, even after its returned CGImage has been destroyed.
+        // CGDisplayCreateImage preserves the display's native pixel dimensions.
+        CGDisplayCreateImage(displayID)
     }
 
     private func createCaptureWindows(initialImages: [CGDirectDisplayID: ManagedRasterImage]) {
@@ -184,12 +268,12 @@ class CaptureManager: NSObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func createCaptureWindow(for screen: NSScreen, initialImage: ManagedRasterImage?) -> NSWindow {
+    private func createCaptureWindow(for screen: NSScreen, initialImage: ManagedRasterImage?) -> CaptureWindow {
         let window = CaptureWindow(
             contentRect: screen.frame,
             styleMask: [.borderless],
             backing: .buffered,
-            defer: true,  // 延迟创建 backing store
+            defer: true,
             screen: screen
         )
 
@@ -228,13 +312,21 @@ class CaptureManager: NSObject {
         // 不复制图片，直接传递引用
         let pos = position
         captureSessionID &+= 1
+        pendingFloatingWindowCreationCount += 1
         closeAllWindows()
         isCapturing = false
         Logger.logMemory("📸 handleCapturedImage 完成，准备创建贴图")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             FloatingImageManager.shared.createFloatingWindow(with: image, at: pos)
+            guard let self else { return }
+            self.pendingFloatingWindowCreationCount = max(0, self.pendingFloatingWindowCreationCount - 1)
         }
+    }
+
+    func cancelCapture() {
+        guard hasActiveCaptureSession else { return }
+        handleCancel()
     }
 
     private func handleCancel() {

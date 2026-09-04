@@ -4,12 +4,12 @@
 autoreleasepool {
     MainActor.assumeIsolated {
         let app = NSApplication.shared
-        let delegate = AppDelegate()
+        let isUIHelper = CommandLine.arguments.contains("--ui-helper")
+        let delegate: NSApplicationDelegate = isUIHelper ? HelperAppDelegate() : AppDelegate()
         app.delegate = delegate
 
-        // NSApplication does not strongly retain its delegate. Keep AppDelegate alive for
-        // the complete event loop so applicationShouldTerminateAfterLastWindowClosed(_:)
-        // remains effective when the final floating image window is closed.
+        // NSApplication does not strongly retain its delegate. Keep the selected process
+        // role alive for the complete event loop.
         withExtendedLifetime(delegate) {
             app.run()
         }

@@ -959,6 +959,9 @@ class CaptureView: NSView {
             }
 
             let imageToSave = captureView.renderFinalImage(from: captureResult.image)
+            // CaptureManager becomes idle when its overlay closes, but the save panel and
+            // encoder still own image work. Keep the helper alive until both are finished.
+            HelperLifetimeCoordinator.beginOperation()
             captureView.cancelCapture()
             captureView.showSavePanelForImage(imageToSave)
         }
@@ -998,6 +1001,8 @@ class CaptureView: NSView {
 
                     if response == .OK, let url = savePanel.url {
                         self.saveImage(image, to: url)
+                    } else {
+                        HelperLifetimeCoordinator.endOperation()
                     }
                 }
             }
@@ -1005,10 +1010,19 @@ class CaptureView: NSView {
     }
 
     private func saveImage(_ image: ManagedRasterImage, to url: URL) {
-        // 在后台线程处理图片保存
+        // 后台编码只在任务执行期间持有图片；完成后清空临时对象并归还空闲页。
         DispatchQueue.global(qos: .userInitiated).async {
             autoreleasepool {
-                try? image.write(to: url)
+                do {
+                    try image.write(to: url)
+                    Logger.log("💾 图片保存完成: \(url.lastPathComponent)")
+                } catch {
+                    Logger.log("❌ 图片保存失败: \(error.localizedDescription)")
+                }
+            }
+            malloc_zone_pressure_relief(nil, 0)
+            DispatchQueue.main.async {
+                HelperLifetimeCoordinator.endOperation()
             }
         }
     }
@@ -1023,10 +1037,19 @@ class CaptureView: NSView {
                 }
 
                 let roundedImage = captureView.renderFinalImage(from: captureResult.image)
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.writeObjects([roundedImage.makeNSImageForPasteboard()])
+                autoreleasepool {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    if let pngData = roundedImage.pngData() {
+                        pasteboard.setData(pngData, forType: .png)
+                    } else if let tiffData = roundedImage.tiffData() {
+                        pasteboard.setData(tiffData, forType: .tiff)
+                    } else {
+                        Logger.log("❌ 图片编码失败，未写入剪贴板")
+                    }
+                }
                 captureView.cancelCapture()
+                malloc_zone_pressure_relief(nil, 0)
             }
         } else {
             // 选择模式下，取消
