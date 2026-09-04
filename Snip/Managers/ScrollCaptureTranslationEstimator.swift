@@ -5,7 +5,7 @@ import CoreGraphics
 /// The matcher deliberately uses several spatial regions. A fixed line-number gutter,
 /// minimap, tab bar, or status bar can therefore be rejected as an outlier instead of
 /// dominating one whole-image registration result.
-nonisolated struct ScrollCaptureTranslationEstimator: Sendable {
+struct ScrollCaptureTranslationEstimator: Sendable {
     enum Status: Equatable, Sendable {
         case accepted
         case duplicate
@@ -21,41 +21,97 @@ nonisolated struct ScrollCaptureTranslationEstimator: Sendable {
         let supportingRegions: Int
         let bestScore: Double
         let secondBestScore: Double?
+
+        nonisolated init(
+            status: Status,
+            verticalOffsetInPixels: Int,
+            confidence: Double,
+            ambiguity: Double,
+            supportingRegions: Int,
+            bestScore: Double,
+            secondBestScore: Double?
+        ) {
+            self.status = status
+            self.verticalOffsetInPixels = verticalOffsetInPixels
+            self.confidence = confidence
+            self.ambiguity = ambiguity
+            self.supportingRegions = supportingRegions
+            self.bestScore = bestScore
+            self.secondBestScore = secondBestScore
+        }
     }
 
     struct Configuration: Sendable {
-        var maximumAnalysisWidth = 400
-        var minimumOffset = 1
-        var maximumOffsetFraction = 0.82
-        var sampleStepX = 2
-        var sampleStepY = 2
-        var minimumRegionEdgeSamples = 3
-        var maximumAcceptedScore = 32.0
-        var minimumSupportingRegions = 3
-        var ambiguityScoreGap = 1.8
-        var ambiguityRatio = 1.08
-        var duplicateScore = 2.0
+        var maximumAnalysisWidth: Int
+        var minimumOffset: Int
+        var maximumOffsetFraction: Double
+        var sampleStepX: Int
+        var sampleStepY: Int
+        var minimumRegionEdgeSamples: Int
+        var maximumAcceptedScore: Double
+        var minimumSupportingRegions: Int
+        var ambiguityScoreGap: Double
+        var ambiguityRatio: Double
+        var duplicateScore: Double
+
+        nonisolated init(
+            maximumAnalysisWidth: Int = 400,
+            minimumOffset: Int = 1,
+            maximumOffsetFraction: Double = 0.82,
+            sampleStepX: Int = 2,
+            sampleStepY: Int = 2,
+            minimumRegionEdgeSamples: Int = 3,
+            maximumAcceptedScore: Double = 32.0,
+            minimumSupportingRegions: Int = 3,
+            ambiguityScoreGap: Double = 1.8,
+            ambiguityRatio: Double = 1.08,
+            duplicateScore: Double = 2.0
+        ) {
+            self.maximumAnalysisWidth = maximumAnalysisWidth
+            self.minimumOffset = minimumOffset
+            self.maximumOffsetFraction = maximumOffsetFraction
+            self.sampleStepX = sampleStepX
+            self.sampleStepY = sampleStepY
+            self.minimumRegionEdgeSamples = minimumRegionEdgeSamples
+            self.maximumAcceptedScore = maximumAcceptedScore
+            self.minimumSupportingRegions = minimumSupportingRegions
+            self.ambiguityScoreGap = ambiguityScoreGap
+            self.ambiguityRatio = ambiguityRatio
+            self.duplicateScore = duplicateScore
+        }
     }
 
     private struct GrayImage {
         let width: Int
         let height: Int
         let bytes: [UInt8]
+
+        nonisolated init(width: Int, height: Int, bytes: [UInt8]) {
+            self.width = width
+            self.height = height
+            self.bytes = bytes
+        }
     }
 
     private struct Candidate {
         let offset: Int
         let score: Double
         let supportingRegions: Int
+
+        nonisolated init(offset: Int, score: Double, supportingRegions: Int) {
+            self.offset = offset
+            self.score = score
+            self.supportingRegions = supportingRegions
+        }
     }
 
     private let configuration: Configuration
 
-    init(configuration: Configuration = Configuration()) {
+    nonisolated init(configuration: Configuration = Configuration()) {
         self.configuration = configuration
     }
 
-    func estimate(
+    nonisolated func estimate(
         previous: CGImage,
         current: CGImage,
         expectedDirection: Int = 0
@@ -149,7 +205,7 @@ nonisolated struct ScrollCaptureTranslationEstimator: Sendable {
         )
     }
 
-    private func samePositionScore(previous: GrayImage, current: GrayImage) -> Double {
+    private nonisolated func samePositionScore(previous: GrayImage, current: GrayImage) -> Double {
         var difference = 0.0
         var count = 0
         for y in stride(from: 0, to: previous.height, by: configuration.sampleStepY) {
@@ -164,7 +220,7 @@ nonisolated struct ScrollCaptureTranslationEstimator: Sendable {
         return count > 0 ? difference / Double(count) : .infinity
     }
 
-    private func score(
+    private nonisolated func score(
         previous: GrayImage,
         current: GrayImage,
         offset: Int,
@@ -260,7 +316,7 @@ nonisolated struct ScrollCaptureTranslationEstimator: Sendable {
         )
     }
 
-    private func sparsePixelCandidates(
+    private nonisolated func sparsePixelCandidates(
         previous: GrayImage,
         current: GrayImage,
         maximumOffset: Int
@@ -296,7 +352,7 @@ nonisolated struct ScrollCaptureTranslationEstimator: Sendable {
         return selected
     }
 
-    private func makeGrayImage(_ image: CGImage) -> GrayImage? {
+    private nonisolated func makeGrayImage(_ image: CGImage) -> GrayImage? {
         // Horizontal downscaling is safe for a vertical translation estimate. Preserve
         // vertical source pixels whenever practical: fractional Y scaling destroys code
         // line periodicity and can move the best match by one or more text rows.
@@ -326,7 +382,7 @@ nonisolated struct ScrollCaptureTranslationEstimator: Sendable {
         return created ? GrayImage(width: width, height: height, bytes: bytes) : nil
     }
 
-    private func invalidResult(best: Candidate? = nil) -> Result {
+    private nonisolated func invalidResult(best: Candidate? = nil) -> Result {
         Result(
             status: .invalid,
             verticalOffsetInPixels: 0,

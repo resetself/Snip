@@ -2,7 +2,7 @@ import CoreGraphics
 
 /// Composes only newly revealed scroll content while keeping fixed top/bottom chrome
 /// at the outside edge of the final image.
-nonisolated struct ScrollCaptureStripComposer: Sendable {
+struct ScrollCaptureStripComposer: Sendable {
     enum Edge: Sendable {
         case bottom
         case top
@@ -11,9 +11,16 @@ nonisolated struct ScrollCaptureStripComposer: Sendable {
     struct FixedInsets: Equatable, Sendable {
         let top: Int
         let bottom: Int
+
+        nonisolated init(top: Int, bottom: Int) {
+            self.top = top
+            self.bottom = bottom
+        }
     }
 
-    func fixedInsets(previous: CGImage, current: CGImage) -> FixedInsets {
+    nonisolated init() {}
+
+    nonisolated func fixedInsets(previous: CGImage, current: CGImage) -> FixedInsets {
         guard previous.width == current.width,
               previous.height == current.height,
               let lhs = grayscale(previous),
@@ -30,7 +37,7 @@ nonisolated struct ScrollCaptureStripComposer: Sendable {
         )
     }
 
-    func compose(
+    nonisolated func compose(
         base: CGImage,
         previousViewport: CGImage,
         currentViewport: CGImage,
@@ -129,9 +136,15 @@ nonisolated struct ScrollCaptureStripComposer: Sendable {
         let width: Int
         let height: Int
         let bytes: [UInt8]
+
+        nonisolated init(width: Int, height: Int, bytes: [UInt8]) {
+            self.width = width
+            self.height = height
+            self.bytes = bytes
+        }
     }
 
-    private func grayscale(_ image: CGImage) -> GrayImage? {
+    private nonisolated func grayscale(_ image: CGImage) -> GrayImage? {
         let width = min(image.width, 400)
         let height = image.height
         var bytes = [UInt8](repeating: 0, count: width * height)
@@ -153,7 +166,7 @@ nonisolated struct ScrollCaptureStripComposer: Sendable {
         return created ? GrayImage(width: width, height: height, bytes: bytes) : nil
     }
 
-    private func fixedBandLength(
+    private nonisolated func fixedBandLength(
         lhs: GrayImage,
         rhs: GrayImage,
         fromTop: Bool,
@@ -187,7 +200,7 @@ nonisolated struct ScrollCaptureStripComposer: Sendable {
         return lastFixedRow >= 1 ? lastFixedRow + 1 : 0
     }
 
-    private func makeContext(width: Int, height: Int) -> CGContext? {
+    private nonisolated func makeContext(width: Int, height: Int) -> CGContext? {
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         return CGContext(
             data: nil,
