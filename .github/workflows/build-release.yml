@@ -23,36 +23,6 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      - name: Import Developer ID signing certificate
-        env:
-          DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
-          DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
-        run: |
-          set -euo pipefail
-          test -n "$DEVELOPER_ID_APPLICATION_P12_BASE64"
-          test -n "$DEVELOPER_ID_APPLICATION_P12_PASSWORD"
-
-          KEYCHAIN_PATH="$RUNNER_TEMP/snip-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
-          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-application.p12"
-
-          printf '%s' "$DEVELOPER_ID_APPLICATION_P12_BASE64" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERTIFICATE_PATH" \
-            -P "$DEVELOPER_ID_APPLICATION_P12_PASSWORD" \
-            -A -t cert -f pkcs12 \
-            -k "$KEYCHAIN_PATH"
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
-
-          SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
-          test -n "$SIGNING_IDENTITY"
-          echo "SNIP_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
-
       - name: Build universal Release app
         run: |
           set -o pipefail
@@ -68,24 +38,24 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build | tee "$RUNNER_TEMP/xcodebuild.log"
 
-      - name: Sign and verify application
+      - name: Ad-hoc sign and verify application
         run: |
           set -euo pipefail
           APP_PATH="$RUNNER_TEMP/SnipDerivedData/Build/Products/Release/Snip.app"
           test -d "$APP_PATH"
 
+          # Free distribution mode: ad-hoc signing requires no certificate or secrets.
+          # macOS may require screen-recording permission again after an app update.
           /usr/bin/codesign \
             --force \
-            --sign "$SNIP_SIGNING_IDENTITY" \
-            --options runtime \
-            --timestamp \
+            --deep \
+            --sign - \
             "$APP_PATH"
 
           /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           /usr/bin/codesign -dv --verbose=4 "$APP_PATH" 2>&1 | tee "$RUNNER_TEMP/codesign.txt"
-          grep -q "Authority=Developer ID Application:" "$RUNNER_TEMP/codesign.txt"
           grep -q "Identifier=com.m3di.Snip" "$RUNNER_TEMP/codesign.txt"
-          grep -q "TeamIdentifier=" "$RUNNER_TEMP/codesign.txt"
+          grep -q "Signature=adhoc" "$RUNNER_TEMP/codesign.txt"
 
       - name: Verify application architectures
         run: |
