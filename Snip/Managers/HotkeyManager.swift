@@ -18,31 +18,10 @@ class HotkeyManager {
     // MARK: - 设置快捷键
 
     func setup() {
-        checkAccessibilityPermission()
+        // Carbon's RegisterEventHotKey works without Accessibility permission. Prompting
+        // through AXIsProcessTrustedWithOptions here made every newly built or unsigned
+        // app ask for an unrelated permission at launch.
         registerHotKeys()
-    }
-
-    /// 检查并请求辅助功能权限
-    private func checkAccessibilityPermission() {
-        let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-        let accessEnabled = AXIsProcessTrustedWithOptions(options)
-
-        if !accessEnabled {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let alert = NSAlert()
-                alert.messageText = "需要辅助功能权限"
-                alert.informativeText = "Snip 需要辅助功能权限来监听全局快捷键。\n\n请在系统设置 > 隐私与安全性 > 辅助功能中，允许 Snip 访问。"
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "打开系统设置")
-                alert.addButton(withTitle: "稍后")
-
-                if alert.runModal() == .alertFirstButtonReturn {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-            }
-        }
     }
 
     func updateHotkeys() {
