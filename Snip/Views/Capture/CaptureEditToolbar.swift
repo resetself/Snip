@@ -835,7 +835,10 @@ class CaptureEditToolbar: NSView {
         let button = ScrollableButton()
         button.title = icon
         button.bezelStyle = .rounded
-        button.isBordered = true
+        // Use only the custom CALayer border below. AppKit's bezel adds a
+        // second, wider white border in Release builds.
+        button.isBordered = false
+        button.focusRingType = .none
         button.toolTip = tooltip
         button.tag = tag
         button.target = self
