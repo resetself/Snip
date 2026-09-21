@@ -13,7 +13,7 @@ fileprivate final class MosaicCellStorage {
     }
 }
 
-class AnnotationLayer: NSView {
+class AnnotationLayer: NSView, NSTextFieldDelegate {
 
     private struct RasterizedImage {
         let cgImage: CGImage
@@ -65,6 +65,7 @@ class AnnotationLayer: NSView {
 
     var currentTool: AnnotationTool = .select {  // 默认为选择工具
         didSet {
+            if currentTool != .text { _ = commitPendingTextEdits() }
             if currentTool != .select {
                 clearArrowSelection()
             }
@@ -140,7 +141,7 @@ class AnnotationLayer: NSView {
             return hitView
         }
 
-        return hitTestEditableContent(at: point) ? self : nil
+        return hitTestEditableContent(at: convert(point, from: superview)) ? self : nil
     }
 
     func setMosaicSourceImage(_ image: ManagedRasterImage?) {
@@ -277,7 +278,20 @@ class AnnotationLayer: NSView {
         case .mosaic:
             break  // 马赛克按颗粒规格批量绘制
         case .text:
-            drawText(annotation.text ?? "", at: startPoint, color: annotation.color)
+            if let cell = annotation.textCell, let size = annotation.textFrameSize {
+                // NSTextField lays out in flipped coordinates. Preserve its cell and
+                // frame instead of reinterpreting a top-left point as a baseline.
+                context.saveGState()
+                context.translateBy(x: startPoint.x, y: startPoint.y + size.height)
+                context.scaleBy(x: 1, y: -1)
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+                cell.drawInterior(withFrame: CGRect(origin: .zero, size: size), in: self)
+                NSGraphicsContext.restoreGraphicsState()
+                context.restoreGState()
+            } else {
+                drawText(annotation.text ?? "", at: startPoint, color: annotation.color, font: annotation.textFont)
+            }
         }
 
         context.restoreGState()
@@ -398,9 +412,9 @@ class AnnotationLayer: NSView {
         context.strokePath()
     }
 
-    private func drawText(_ text: String, at point: NSPoint, color: NSColor) {
+    private func drawText(_ text: String, at point: NSPoint, color: NSColor, font: NSFont?) {
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 16, weight: .medium),
+            .font: font ?? NSFont.systemFont(ofSize: 16, weight: .medium),
             .foregroundColor: color
         ]
         let attributedString = NSAttributedString(string: text, attributes: attributes)
@@ -670,6 +684,16 @@ class AnnotationLayer: NSView {
               annotations.indices.contains(selectedAnnotationIndex) else { return }
 
         let annotation = annotations[selectedAnnotationIndex]
+        if annotation.type == .text {
+            var rect = textBounds(for: annotation)
+            rect.origin.y += offsetY
+            NSColor.systemBlue.setStroke()
+            let border = NSBezierPath(rect: rect)
+            border.lineWidth = 1
+            border.setLineDash([3, 3], count: 2, phase: 0)
+            border.stroke()
+            return
+        }
         guard isEditableArrow(annotation) else { return }
 
         let visibleNodes = visibleArrowNodes(for: annotation, offsetY: offsetY)
@@ -1352,7 +1376,12 @@ class AnnotationLayer: NSView {
         }
 
         if currentTool == .text {
-            // 文字工具：显示输入框
+            // Clicking outside the editor finishes this insertion, rather than
+            // creating another text box as focus moves away from the first one.
+            if subviews.contains(where: { $0 is DraggableTextField }) {
+                _ = commitPendingTextEdits()
+                return
+            }
             showTextInput(at: visiblePoint)
         } else if currentTool == .pen || currentTool == .mosaic {
             // 画笔和马赛克工具：开始记录路径
@@ -1507,6 +1536,7 @@ class AnnotationLayer: NSView {
         textField.font = font
 
         textField.focusRingType = .none
+        textField.delegate = self
         textField.target = self
         textField.action = #selector(textFieldDidEnd(_:))
 
@@ -1525,8 +1555,35 @@ class AnnotationLayer: NSView {
         window?.makeFirstResponder(textField)
     }
 
+    /// Finish the field editor before rasterizing: subviews are not drawn by captureAsImage.
+    @discardableResult
+    func commitPendingTextEdits() -> Bool {
+        if subviews.contains(where: { ($0 as? NSTextField)?.currentEditor() != nil }),
+           let window, !window.makeFirstResponder(self) {
+            return false
+        }
+        for case let field as DraggableTextField in subviews {
+            textFieldDidEnd(field)
+        }
+        return true
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? DraggableTextField else { return }
+        textFieldDidEnd(field)
+    }
+
     @objc private func textFieldDidEnd(_ sender: NSTextField) {
-        let text = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Ending editing can also invoke this action. Commit each field only once.
+        guard sender.superview === self else { return }
+        let text = sender.stringValue
+        let style = (sender as? DraggableTextField)?.currentStyle ?? currentStyle
+        let textOrigin = sender.frame.origin
+        let textCell = sender.cell?.copy() as? NSTextFieldCell
+        textCell?.isHighlighted = false
+        textCell?.showsFirstResponder = false
 
         // 清理文本框的回调，避免循环引用
         if let textField = sender as? DraggableTextField {
@@ -1534,24 +1591,33 @@ class AnnotationLayer: NSView {
             textField.parentAnnotationLayer = nil
         }
 
-        // 先移除文本框
+        // Remove first: changing tools commits any remaining editors and must
+        // not re-enter submission for this field.
+        sender.delegate = nil
         sender.removeFromSuperview()
+        if currentTool == .text {
+            currentTool = .select
+            onToolSelectionChanged?(.select)
+        }
 
         // 如果内容为空，不保存
-        if text.isEmpty {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return
         }
 
         // 保存文字标注
         let annotation = Annotation(
             type: .text,
-            startPoint: documentPoint(from: sender.frame.origin),
-            endPoint: documentPoint(from: sender.frame.origin),
-            color: currentStyle.color,
-            lineWidth: currentStyle.lineWidth,
-            lineStyle: currentStyle.lineStyle,
-            shapeStyle: currentStyle.shapeStyle,
-            text: text
+            startPoint: documentPoint(from: textOrigin),
+            endPoint: documentPoint(from: textOrigin),
+            color: sender.textColor ?? style.color,
+            lineWidth: style.lineWidth,
+            lineStyle: style.lineStyle,
+            shapeStyle: style.shapeStyle,
+            text: text,
+            textFont: sender.font,
+            textCell: textCell,
+            textFrameSize: sender.frame.size
         )
         annotations.append(annotation)
         // 清空重做栈，因为有新的操作
@@ -1670,11 +1736,28 @@ class AnnotationLayer: NSView {
 
         if let selectedAnnotationIndex,
            annotations.indices.contains(selectedAnnotationIndex),
+           isEditableArrow(annotations[selectedAnnotationIndex]),
            hitTestArrowNode(in: annotations[selectedAnnotationIndex], at: point) != nil {
             return true
         }
 
-        return hitTestArrowPath(at: point) != nil
+        return hitTestText(at: point) != nil || hitTestArrowPath(at: point) != nil
+    }
+
+    private func textBounds(for annotation: Annotation) -> CGRect {
+        if let size = annotation.textFrameSize {
+            return CGRect(origin: annotation.startPoint, size: size).insetBy(dx: -4, dy: -4)
+        }
+        let size = ((annotation.text ?? "") as NSString).size(withAttributes: [
+            .font: annotation.textFont ?? NSFont.systemFont(ofSize: 16, weight: .medium)
+        ])
+        return CGRect(origin: annotation.startPoint, size: size).insetBy(dx: -4, dy: -4)
+    }
+
+    private func hitTestText(at point: CGPoint) -> Int? {
+        annotations.indices.reversed().first {
+            annotations[$0].type == .text && textBounds(for: annotations[$0]).contains(point)
+        }
     }
 
     func shouldHandleSelectionEvent(at visiblePoint: CGPoint) -> Bool {
@@ -1683,7 +1766,17 @@ class AnnotationLayer: NSView {
     }
 
     private func handleSelectionMouseDown(at point: CGPoint, clickCount: Int) {
+        if let textIndex = hitTestText(at: point) {
+            selectedAnnotationIndex = textIndex
+            arrowDragMode = .wholeAnnotation
+            lastDragDocumentPoint = point
+            needsDisplay = true
+            return
+        }
+
         if let selectedAnnotationIndex,
+           annotations.indices.contains(selectedAnnotationIndex),
+           isEditableArrow(annotations[selectedAnnotationIndex]),
            let nodeIndex = hitTestArrowNode(
                 in: annotations[selectedAnnotationIndex],
                 at: point
@@ -2052,6 +2145,9 @@ struct Annotation {
     let shapeStyle: ShapeStyle
     let lineCurvature: CGFloat
     var text: String?
+    var textFont: NSFont?
+    var textCell: NSTextFieldCell?
+    var textFrameSize: NSSize?
     var penPath: [NSPoint]?
     var curvePoints: [NSPoint]?
     fileprivate var mosaicCellStorage: MosaicCellStorage?
@@ -2066,6 +2162,9 @@ struct Annotation {
         shapeStyle: ShapeStyle,
         lineCurvature: CGFloat = 0,
         text: String? = nil,
+        textFont: NSFont? = nil,
+        textCell: NSTextFieldCell? = nil,
+        textFrameSize: NSSize? = nil,
         penPath: [NSPoint]? = nil,
         curvePoints: [NSPoint]? = nil,
         mosaicCellStorage: MosaicCellStorage? = nil
@@ -2079,6 +2178,9 @@ struct Annotation {
         self.shapeStyle = shapeStyle
         self.lineCurvature = lineCurvature
         self.text = text
+        self.textFont = textFont
+        self.textCell = textCell
+        self.textFrameSize = textFrameSize
         self.penPath = penPath
         self.curvePoints = curvePoints
         self.mosaicCellStorage = mosaicCellStorage

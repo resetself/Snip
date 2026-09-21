@@ -10,22 +10,17 @@ let package = Package(
     targets: [
         .target(
             name: "SnipScrollCaptureCore",
-            path: "Snip/Managers",
-            exclude: [
-                "CaptureManager.swift",
-                "FloatingImageManager.swift",
-                "HotkeyManager.swift",
-                "PreferencesManager.swift",
-                "ScreenCaptureContentCache.swift",
-                "ScrollCaptureManager.swift",
-                "StatusBarManager.swift",
-                "WindowDetectionManager.swift"
-            ],
-            sources: [
-                "ScrollCaptureTranslationEstimator.swift",
-                "ScrollCaptureStripComposer.swift",
-                "ScrollCaptureLiveOffsetAccumulator.swift"
+            path: "Snip",
+            exclude: ["App/main.swift", "Resources"],
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
             ]
+        ),
+        .testTarget(
+            name: "SnipCaptureUITests",
+            dependencies: ["SnipScrollCaptureCore"],
+            path: "Tests/SnipCaptureUITests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
             name: "SnipScrollCaptureCoreTests",

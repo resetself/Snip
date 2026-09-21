@@ -55,12 +55,14 @@ class CaptureView: NSView {
     private var selectionPreviewTask: Task<Void, Never>?
     private var captureTaskGeneration: UInt64 = 0
     private var selectionPreviewTaskGeneration: UInt64 = 0
+    private var scrollSelectionTrackingTimer: Timer?
     private var scrollEventTap: CFMachPort?
     private var scrollEventTapSource: CFRunLoopSource?
     private var scrollInteractionRestoreWorkItem: DispatchWorkItem?
     private let scrollInteractionRestoreDelay: TimeInterval = 0.12
     private var isScrollInteractionSuspended = false
     private var isCleanedUp = false
+    private var isPreparingOutput = false
 
     // 编辑模式相关
     private var isEditMode = false
@@ -280,7 +282,7 @@ class CaptureView: NSView {
         return currentSelectionPreviewImage()
     }
 
-    private func currentSelectionPreviewImage() -> ManagedRasterImage? {
+    func currentSelectionPreviewImage() -> ManagedRasterImage? {
         guard let selectionPreviewImage,
               let selectionPreviewScreenRect,
               let captureRegion = pixelAlignedCaptureRegion(forSelectionRect: selectionRect),
@@ -291,7 +293,7 @@ class CaptureView: NSView {
         return selectionPreviewImage
     }
 
-    private func refreshAnnotationLayerMosaicSourceIfNeeded() {
+    func refreshAnnotationLayerMosaicSourceIfNeeded() {
         guard isEditMode, let annotationLayer else {
             invalidateSelectionPreviewImage()
             return
@@ -305,13 +307,11 @@ class CaptureView: NSView {
 
         guard annotationLayer.needsMosaicSourceImage() else {
             annotationLayer.setMosaicSourceImage(nil)
-            invalidateSelectionPreviewImage()
             return
         }
 
         if let baseImage = currentSelectionBaseImage() {
             annotationLayer.setMosaicSourceImage(baseImage)
-            releaseSelectionPreviewImage()
             return
         }
 
@@ -419,6 +419,12 @@ class CaptureView: NSView {
             return nil
         }
 
+        guard !Task.isCancelled,
+              pixelAlignedCaptureRegion(forSelectionRect: selectionRect)?.screenRect == captureRegion.screenRect else {
+            return nil
+        }
+        selectionPreviewImage = capturedImage
+        selectionPreviewScreenRect = captureRegion.screenRect
         return (capturedImage, windowPosition)
     }
 
@@ -499,6 +505,7 @@ class CaptureView: NSView {
 
 
     override func mouseDown(with event: NSEvent) {
+        guard !isPreparingOutput else { return }
         IdleMemoryReclaimer.shared.markUserActivity()
         let point = event.locationInWindow
 
@@ -585,6 +592,7 @@ class CaptureView: NSView {
         IdleMemoryReclaimer.shared.markUserActivity()
         let point = event.locationInWindow
 
+        if isPreparingOutput { return }
         if isEditMode {
             if isForwardingMouseEventsToAnnotationLayer {
                 annotationLayer?.mouseDragged(with: event)
@@ -627,6 +635,7 @@ class CaptureView: NSView {
             dragStartPoint = nil
 
             if didAdjustSelection {
+                refreshSelectionPreviewImage()
                 refreshAnnotationLayerMosaicSourceIfNeeded()
             }
         } else {
@@ -775,7 +784,7 @@ class CaptureView: NSView {
         return clampedRect
     }
 
-    private func applyAdjustedSelectionRect(_ rect: NSRect) {
+    func applyAdjustedSelectionRect(_ rect: NSRect) {
         selectionRect = rect
         updateAnnotationLayerFrame()
         updateToolbarPosition()
@@ -923,6 +932,10 @@ class CaptureView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if isPreparingOutput {
+            if event.keyCode == 53 { cancelCapture() }
+            return
+        }
         IdleMemoryReclaimer.shared.markUserActivity()
         // Cmd+S: 保存并关闭
         if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "s" {
@@ -951,14 +964,7 @@ class CaptureView: NSView {
             return
         }
 
-        replaceCaptureTask { view in
-            let captureView = view
-            guard let captureResult = await captureView.loadCurrentSelectionBaseImage() else {
-                captureView.cancelCapture()
-                return
-            }
-
-            let imageToSave = captureView.renderFinalImage(from: captureResult.image)
+        prepareOutput { captureView, imageToSave, _ in
             // CaptureManager becomes idle when its overlay closes, but the save panel and
             // encoder still own image work. Keep the helper alive until both are finished.
             HelperLifetimeCoordinator.beginOperation()
@@ -1029,14 +1035,7 @@ class CaptureView: NSView {
 
     private func copyAndClose() {
         if isEditMode {
-            replaceCaptureTask { view in
-                let captureView = view
-                guard let captureResult = await captureView.loadCurrentSelectionBaseImage() else {
-                    captureView.cancelCapture()
-                    return
-                }
-
-                let roundedImage = captureView.renderFinalImage(from: captureResult.image)
+            prepareOutput { captureView, roundedImage, _ in
                 autoreleasepool {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
@@ -1066,7 +1065,7 @@ class CaptureView: NSView {
     //     return super.hitTest(point)
     // }
 
-    private func enterEditMode() {
+    func enterEditMode() {
         IdleMemoryReclaimer.shared.markUserActivity()
         isEditMode = true
 
@@ -1314,146 +1313,77 @@ class CaptureView: NSView {
     }
 
     private func finishCapture() {
-        Logger.log("🎯 finishCapture 被调用")
-        Logger.log("🎯 isScrollCaptureMode: \(isScrollCaptureMode)")
-        Logger.log("🎯 captureCount: \(ScrollCaptureManager.shared.captureCount)")
-
-        // 如果在长截图模式，拼接图片
-        if isScrollCaptureMode && ScrollCaptureManager.shared.captureCount > 0 {
-            finishScrollCapture()
-        } else {
-            // 如果在长截图模式但没有捕获图片，也要使用保存的坐标
-            if isScrollCaptureMode {
-                Logger.log("⚠️ 长截图模式但没有捕获图片，使用保存的坐标")
-                endScrollCaptureAnnotationTracking(committingVisibleState: true)
-                ScrollCaptureManager.shared.clear()
-                isScrollCaptureMode = false
-                updateScrollCaptureButton(active: false)
-                captureSelectionWithSavedCoordinates()
-            } else {
-                captureSelection()
-            }
+        prepareOutput { view, image, position in
+            view.completeCapture(with: image, at: position)
         }
     }
 
-    private func captureSelectionWithSavedCoordinates() {
-        replaceCaptureTask { view in
-            let captureView = view
-            guard let capturedImage = await captureView.captureCurrentSelection() else {
-                captureView.cancelCapture()
-                return
-            }
-
-            let windowPosition = NSPoint(
-                x: captureView.scrollCaptureScreenRect.origin.x,
-                y: captureView.scrollCaptureScreenRect.origin.y
-            )
-
-            captureView.purgeImage(&captureView.screenImage)
-            captureView.finalizeSelectionCapture(baseImage: capturedImage, at: windowPosition)
-        }
-    }
-
-    private func finishScrollCapture() {
-        Logger.log("🏁 开始完成长截图")
-        Logger.log("🏁 当前已捕获: \(ScrollCaptureManager.shared.captureCount) 张")
-
-        replaceCaptureTask { view in
-            let captureView = view
-
-            ScrollCaptureManager.shared.stopAutoCapture()
-            await ScrollCaptureManager.shared.waitForIdle()
-
-            guard !Task.isCancelled else { return }
-
-            if ScrollCaptureManager.shared.hasMeaningfulUncapturedContent() {
-                Logger.log("📸 开始捕获最后一张图片...")
-                if let lastImage = await captureView.captureCurrentSelection() {
-                    Logger.log("✅ 成功捕获最后一张，大小: \(lastImage.logicalSize)")
-                    await ScrollCaptureManager.shared.addFinalImage(lastImage)
-                    Logger.log("📸 添加后总数: \(ScrollCaptureManager.shared.captureCount) 张")
-                } else {
-                    Logger.log("❌ 捕获最后一张失败！")
-                }
-            } else {
-                Logger.log("ℹ️ 当前可见区域已在已捕获范围内，跳过最后一帧补抓")
-            }
-
-            captureView.performStitchAndSave()
-        }
-    }
-
-    private func performStitchAndSave() {
-        // 拼接图片
-        guard let finalImage = ScrollCaptureManager.shared.stitchImages() else {
-            Logger.log("⚠️ 拼接图片失败，使用普通截图")
-            // 如果拼接失败，恢复窗口后使用普通截图
-            endScrollCaptureAnnotationTracking(committingVisibleState: true)
-            ScrollCaptureManager.shared.clear()
-            restoreWindowToFullScreen()
-            isScrollCaptureMode = false
-            updateScrollCaptureButton(active: false)
-            captureSelectionWithSavedCoordinates()
+    /// All output destinations consume exactly the same flattened image.
+    private func prepareOutput(
+        _ deliver: @escaping @MainActor (CaptureView, ManagedRasterImage, NSPoint) -> Void
+    ) {
+        guard isEditMode, !isPreparingOutput, !isCleanedUp else { return }
+        isPreparingOutput = true
+        guard annotationLayer?.commitPendingTextEdits() != false else {
+            isPreparingOutput = false
+            Logger.log("❌ 无法提交文字，输出已中止")
             return
         }
-
-        Logger.log("✅ 拼接图片成功，大小: \(finalImage.logicalSize)")
-
-        purgeImage(&self.screenImage)
-        let roundedImage = autoreleasepool { () -> ManagedRasterImage in
-            let mergedImage: ManagedRasterImage
-            if let annotationLayer = annotationLayer,
-               isEditMode,
-               annotationLayer.hasRenderableContent() {
-                mergedImage = mergeAnnotations(
-                    baseImage: finalImage,
-                    annotationLayer: annotationLayer,
-                    annotationOffsetY: ScrollCaptureManager.shared.annotationOffsetForOutput
-                )
-            } else {
-                mergedImage = finalImage
-            }
-
-            return createRoundedImage(from: mergedImage, cornerRadius: cornerRadius)
-        }
-
-        // 使用保存的屏幕坐标作为浮动窗口位置
-        let windowPosition = NSPoint(
-            x: scrollCaptureScreenRect.origin.x,
-            y: scrollCaptureScreenRect.origin.y
-        )
-
-        Logger.log("📍 浮动窗口位置（使用保存的屏幕坐标）: \(windowPosition)")
-
-        // 🚀 释放资源
-        endScrollCaptureAnnotationTracking(committingVisibleState: false)
-        purgeImage(&self.screenImage)
-        ScrollCaptureManager.shared.clear()
-        Task { @MainActor in
-            IdleMemoryReclaimer.shared.reclaimNowIfPossible(reason: "scroll capture cleared")
-        }
-
-        // 保存回调闭包，避免 self 被释放后无法调用
-        let callback = self.onCapture
-
-        // 清空回调，避免循环引用
-        self.onCapture = nil
-
-        // 调用回调，显示浮动贴图窗口（和普通截图一样）
-        callback?(roundedImage, windowPosition)
-    }
-
-    private func captureSelection() {
-        // 取消后台任务
+        let hostWindow = window
+        let detachedToolbar = toolbarWindow
+        hostWindow?.ignoresMouseEvents = true
+        detachedToolbar?.ignoresMouseEvents = true
         replaceCaptureTask { view in
-            let captureView = view
-            guard let captureResult = await captureView.loadCurrentSelectionBaseImage() else {
-                captureView.cancelCapture()
+            defer {
+                view.isPreparingOutput = false
+                if !view.isCleanedUp {
+                    detachedToolbar?.ignoresMouseEvents = false
+                    view.updateScrollCaptureMousePassthrough()
+                    if view.isScrollCaptureMode {
+                        view.installScrollCaptureEventTap()
+                    }
+                }
+            }
+            let baseImage: ManagedRasterImage
+            let position: NSPoint
+            var offsetY: CGFloat = 0
+            if view.isScrollCaptureMode {
+                view.removeScrollCaptureEventTap()
+                let manager = ScrollCaptureManager.shared
+                manager.stopAutoCapture()
+                await manager.waitForIdle()
+                guard !Task.isCancelled else { return }
+                if manager.hasMeaningfulUncapturedContent(),
+                   let lastImage = await view.captureCurrentSelection() {
+                    await manager.addFinalImage(lastImage)
+                }
+                guard !Task.isCancelled else { return }
+                if let stitched = manager.stitchImages() {
+                    baseImage = stitched
+                    offsetY = manager.annotationOffsetForOutput
+                } else {
+                    guard let captured = await view.captureCurrentSelection() else {
+                        Logger.log("❌ 输出底图捕获失败")
+                        return
+                    }
+                    baseImage = captured
+                    offsetY = view.annotationLayer?.viewportOffsetY ?? 0
+                }
+                position = view.scrollCaptureScreenRect.origin
+            } else {
+                guard let result = await view.loadCurrentSelectionBaseImage() else {
+                    Logger.log("❌ 输出底图不可用")
+                    return
+                }
+                baseImage = result.image
+                position = result.position
+            }
+            guard !Task.isCancelled, !view.isCleanedUp,
+                  let image = view.renderFinalImage(from: baseImage, annotationOffsetY: offsetY) else {
+                Logger.log("❌ 输出取消或标注合成失败")
                 return
             }
-
-            captureView.purgeImage(&captureView.screenImage)
-            captureView.finalizeSelectionCapture(baseImage: captureResult.image, at: captureResult.position)
+            deliver(view, image, position)
         }
     }
 
@@ -1498,22 +1428,18 @@ class CaptureView: NSView {
         }
     }
 
-    private func finalizeSelectionCapture(baseImage: ManagedRasterImage, at position: NSPoint) {
-        let roundedImage = renderFinalImage(from: baseImage)
-        completeCapture(with: roundedImage, at: position)
-    }
-
-    private func renderFinalImage(from baseImage: ManagedRasterImage) -> ManagedRasterImage {
-        autoreleasepool { () -> ManagedRasterImage in
+    func renderFinalImage(from baseImage: ManagedRasterImage, annotationOffsetY: CGFloat = 0) -> ManagedRasterImage? {
+        autoreleasepool { () -> ManagedRasterImage? in
             let finalImage: ManagedRasterImage
             if let annotationLayer = annotationLayer,
                isEditMode,
                annotationLayer.hasRenderableContent() {
-                finalImage = mergeAnnotations(
+                guard let merged = mergeAnnotations(
                     baseImage: baseImage,
                     annotationLayer: annotationLayer,
-                    annotationOffsetY: 0
-                )
+                    annotationOffsetY: annotationOffsetY
+                ) else { return nil }
+                finalImage = merged
             } else {
                 finalImage = baseImage
             }
@@ -1620,9 +1546,9 @@ class CaptureView: NSView {
         baseImage: ManagedRasterImage,
         annotationLayer: AnnotationLayer,
         annotationOffsetY: CGFloat
-    ) -> ManagedRasterImage {
+    ) -> ManagedRasterImage? {
         return autoreleasepool {
-            guard let baseRaster = rasterizedImage(from: baseImage) else { return baseImage }
+            guard let baseRaster = rasterizedImage(from: baseImage) else { return nil }
             if annotationLayer.needsMosaicSourceImage() {
                 annotationLayer.setMosaicSourceImage(baseImage)
             } else {
@@ -1635,7 +1561,7 @@ class CaptureView: NSView {
                 offsetY: annotationOffsetY
             ),
                   let layerRaster = rasterizedImage(from: layerImage) else {
-                return baseImage
+                return nil
             }
 
             guard let mergedImage = renderImagePreservingPixels(
@@ -1664,7 +1590,7 @@ class CaptureView: NSView {
                     )
                 )
             }) else {
-                return baseImage
+                return nil
             }
 
             return mergedImage
@@ -1895,6 +1821,10 @@ class CaptureView: NSView {
     }
 
     private func updateScrollCaptureMousePassthrough() {
+        if isPreparingOutput {
+            window?.ignoresMouseEvents = true
+            return
+        }
         let captureWindow = window as? CaptureWindow
         guard isScrollCaptureMode else {
             captureWindow?.allowsInteractiveInput = true
@@ -1902,15 +1832,33 @@ class CaptureView: NSView {
             return
         }
 
+        // Keep routing a drag to its original window, even after leaving the path.
+        if NSEvent.pressedMouseButtons != 0, window?.ignoresMouseEvents == false,
+           !isScrollInteractionSuspended { return }
         let isAnnotating = annotationLayer?.currentTool != .select
-        let acceptsInteraction = isAnnotating && !isScrollInteractionSuspended
+        let hitsAnnotation = scrollSelectionHit(at: NSEvent.mouseLocation)
+        let acceptsInteraction = (isAnnotating || hitsAnnotation) && !isScrollInteractionSuspended
         captureWindow?.allowsInteractiveInput = acceptsInteraction
         window?.ignoresMouseEvents = !acceptsInteraction
         toolbarWindow?.orderFrontRegardless()
     }
 
+    private func scrollSelectionHit(at screenPoint: NSPoint) -> Bool {
+        guard let window, let annotationLayer,
+              annotationLayer.currentTool == .select else { return false }
+        let point = annotationLayer.convert(window.convertPoint(fromScreen: screenPoint), from: nil)
+        return annotationLayer.bounds.contains(point) && annotationLayer.hitTestEditableContent(at: point)
+    }
+
     private func installScrollCaptureEventTap() {
         removeScrollCaptureEventTap()
+        // Polling also works while the window ignores mouse events and needs no
+        // additional global-input permission. Retain mouse ownership during drags.
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateScrollCaptureMousePassthrough() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        scrollSelectionTrackingTimer = timer
 
         let eventMask = CGEventMask(1) << CGEventType.scrollWheel.rawValue
         let userInfo = Unmanaged.passUnretained(self).toOpaque()
@@ -1942,8 +1890,7 @@ class CaptureView: NSView {
     }
 
     private func handleObservedScrollForInteraction(at screenPoint: NSPoint) {
-        guard isScrollCaptureMode,
-              annotationLayer?.currentTool != .select,
+        guard isScrollCaptureMode, !isPreparingOutput,
               scrollCaptureScreenRect.contains(screenPoint) else { return }
 
         scrollInteractionRestoreWorkItem?.cancel()
@@ -1967,6 +1914,8 @@ class CaptureView: NSView {
     }
 
     private func removeScrollCaptureEventTap() {
+        scrollSelectionTrackingTimer?.invalidate()
+        scrollSelectionTrackingTimer = nil
         scrollInteractionRestoreWorkItem?.cancel()
         scrollInteractionRestoreWorkItem = nil
         isScrollInteractionSuspended = false
@@ -2053,9 +2002,8 @@ class CaptureView: NSView {
     }
 
     func reclaimTransientResources() {
-        invalidateSelectionPreviewImage()
-        purgeImage(&screenImage)
-        annotationLayer?.releaseHeavyResources()
+        // An active editor's frozen screenshot is document data, not a transient cache.
+        annotationLayer?.clearTransientCaches()
         invalidateScreenCaptureContentCache()
     }
 
@@ -2124,6 +2072,7 @@ class CaptureView: NSView {
     }
 
     deinit {
+        scrollSelectionTrackingTimer?.invalidate()
         captureTask?.cancel()
         selectionPreviewTask?.cancel()
         Logger.log("🧹 CaptureView 已释放")
