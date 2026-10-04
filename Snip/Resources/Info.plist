@@ -24,6 +24,10 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<!-- 纯菜单栏应用：声明为 UIElement，避免 LaunchServices 在每次被「打开」时把进程
+	     重新提升为 regular（Foreground），从而在程序坞/Dock 里出现 Snip 图标。 -->
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026. All rights reserved.</string>
 	<key>NSAppleEventsUsageDescription</key>
